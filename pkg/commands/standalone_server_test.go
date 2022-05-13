@@ -34,7 +34,7 @@ func TestStartEnvVarArgs(t *testing.T) {
 	os.Setenv("LISTEN-ADDRESS", "127.0.0.1")
 	os.Setenv("UDP-PORT", uport)
 	os.Setenv("TCP-PORT", tport)
-	os.Setenv("UPSTREAM-SERVERS", "[8.8.8.8]")
+	os.Setenv("UPSTREAM-SERVERS", "[1.1.1.1]")
 	hosts := map[string]string{
 		"host.rd.test":  "192.0.2.111",
 		"host2.rd.test": "192.0.2.222",
