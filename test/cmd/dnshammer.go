@@ -25,9 +25,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// 10s timeout should be adequate
-const lookupTimeoutSec = 10
-const defaultRequestNumber = 10
+const lookupTimeoutSec = 10 // 10s timeout should be adequate
+const defaultRequestNumber = 0
 
 // dnshammerCmd represents the dnshammer command
 var dnshammerCmd = &cobra.Command{
@@ -54,13 +53,22 @@ var dnshammerCmd = &cobra.Command{
 	},
 }
 
+func init() {
+	dnshammerCmd.Flags().StringP("server-address", "a", "127.0.0.1:53", "Address of the DNS server.")
+	dnshammerCmd.Flags().StringToStringP("rr-type", "r", map[string]string{},
+		`List of desired resource records mapped to the csv test data file.
+	Supported records are: A, CNAME, TXT, NS, MX, SRV. Accepted Format: A=Arecords.csv,CNAME=cnames.csv`)
+	dnshammerCmd.Flags().IntP("request-number", "n", defaultRequestNumber,
+		"Number of request against the DNS server, if not provided all the entries in a given test data will be used.")
+	rootCmd.AddCommand(dnshammerCmd)
+}
+
 func dnsQuery(srvAddr string, n int, records map[string]string) error {
 	for rr, path := range records {
 		switch rr { //nolint:gocritic // this will have additional cases soon
 		case "A":
 			arecords := testdns.LoadRecords(path)
-			err := do(srvAddr, n, arecords)
-			if err != nil {
+			if err := do(srvAddr, n, arecords); err != nil {
 				return err
 			}
 		}
@@ -69,7 +77,11 @@ func dnsQuery(srvAddr string, n int, records map[string]string) error {
 }
 
 func do(addr string, n int, records map[string][]string) error {
+	var i int
 	for host, ips := range records {
+		if n != defaultRequestNumber && i == n {
+			break
+		}
 		ipResults, err := dnsLookup(addr, "udp", host)
 		if err != nil {
 			return err
@@ -77,7 +89,9 @@ func do(addr string, n int, records map[string][]string) error {
 		if !compare(ips, ipToString(ipResults)) {
 			return fmt.Errorf("expected IP addresses to match, got: %v wanted: %v", ipResults, ips)
 		}
+		i++
 	}
+	logrus.Infof("Successfully tested %v records, against: %v", i, addr)
 	return nil
 }
 
@@ -109,18 +123,8 @@ func dnsLookup(addr, resolverProtocol, domain string) ([]net.IP, error) {
 			return dialer.DialContext(ctx, resolverProtocol, addr)
 		},
 	}
-	// maybe change to debug
-	logrus.Infof("[DNS] lookup on %s [%s] -> %s", addr, resolverProtocol, domain)
+	logrus.Debugf("[DNS] lookup on %s [%s] -> %s", addr, resolverProtocol, domain)
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeoutSec*time.Second)
 	defer cancel()
 	return resolver.LookupIP(ctx, "ip4", domain)
-}
-
-func init() {
-	dnshammerCmd.Flags().StringP("server-address", "a", "127.0.0.1:53", "Address of the DNS server.")
-	dnshammerCmd.Flags().StringToStringP("rr-type", "r", map[string]string{},
-		`List of desired resource records mapped to the csv test data file.
-	Supported records are: A, CNAME, TXT, NS, MX, SRV. Accepted Format: A=Arecords.csv,CNAME=cnames.csv`)
-	dnshammerCmd.Flags().IntP("request-number", "n", defaultRequestNumber, "Number of request against the DNS server.")
-	rootCmd.AddCommand(dnshammerCmd)
 }

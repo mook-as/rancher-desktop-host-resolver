@@ -19,11 +19,11 @@ package e2e
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,54 +41,67 @@ var (
 	dnsPort       = "53"
 )
 
-func TestLookupARecords(t *testing.T) { //nolint // TODO: break down the func
-	tmpDir, err := ioutil.TempDir("", "e2e_test_")
-	require.NoError(t, err, "Failed creating temp dir")
+func TestLookupARecords(t *testing.T) { //nolint:funlen
+	tmpDir := t.TempDir()
 	defer os.RemoveAll(tmpDir)
-	t.Logf("Using %v as a temporary directory", tmpDir)
+
+	t.Logf("Creating %v wsl distro", wslDistroName)
+	installCmd := cmdExec(
+		"",
+		"wsl",
+		"--user", "root",
+		"--install",
+		"--distribution", wslDistroName)
+	err := installCmd.Run()
+	require.NoErrorf(t, err, "Failed to start distro %v", wslDistroName)
+
+	defer func() {
+		t.Logf("Deleting %v wsl distro", wslDistroName)
+		_, err = cmdRunWithOutput("wsl", "--unregister", wslDistroName)
+		require.NoErrorf(t, err, "Failed to start distro %v", wslDistroName)
+	}()
+
+	// It takes a long time to start a new distro,
+	// 20 sec is a long time but that's actually how long
+	// it takes to start a distro without any flakeyness
+	timeout := time.Second * 20
+	tryInterval := time.Second * 2
+	err = confirm(func() bool {
+		// this is a way to figure out if the distro is running
+		// there is an issue with wsl --list --running output
+		// the buffer is not very useful for string search since it
+		// returns some sort of unicode.
+		out, err := cmdRunWithOutput("wsl", "--distribution", wslDistroName, "--exec", "/bin/wslpath", ".")
+		if err != nil {
+			return false
+		}
+		// remove all the weirdness from WSL output
+		return strings.TrimSpace(out) == "."
+	}, tryInterval, timeout)
+	require.NoErrorf(t, err, "Failed to check if %v wsl distro is running", wslDistroName)
 
 	dnsInfs, err := helper.GetDNSInterfaces()
 	require.NoError(t, err, "Failed getting DNS addrs associated to interfaces")
+
 	// This is to cache all the exsisting DNS addresses
 	guidToDNSAddr, err := cacheExsitingDNSAddrs(dnsInfs)
 	require.NoError(t, err, "Failed caching exsisting DNS server addresses")
+
+	// restore the system DNS servers to the original state
+	defer restoreSystemDNS(t, dnsInfs, guidToDNSAddr)
+
 	t.Log("Updating network interfaces with test DNS server addr")
 	// Update the dns addrs to test server
-	testDNSAddr := netip.MustParseAddr(testSrvAddr)
-	testDNSAddrIPv6 := netip.IPv6Unspecified()
-	for _, addr := range dnsInfs {
-		// Set IPv4 DNS
-		err := addr.LUID.SetDNS(winipcfg.AddressFamily(windows.AF_INET), []netip.Addr{testDNSAddr}, []string{})
-		require.NoErrorf(t, err, "Failed setting DNS server for: %v", addr.FriendlyName())
-		// Set IPv6 DNS to unspecified so DNS lookup will not be bypassed
-		err = addr.LUID.SetDNS(windows.AF_INET6, []netip.Addr{testDNSAddrIPv6}, []string{})
-		require.NoErrorf(t, err, "Failed setting DNS server for: %v", addr.FriendlyName())
-	}
-	defer func() {
-		t.Log("Restoring DNS servers back to the original state")
-		for _, addr := range dnsInfs {
-			addrGUID, err := addr.LUID.GUID()
-			require.NoErrorf(t, err, "Failed getting interface GUID for: %v", addr.FriendlyName())
-			if dnsAddr, ok := guidToDNSAddr[addrGUID.String()]; ok {
-				err := addr.LUID.SetDNS(windows.AF_INET, dnsAddr, []string{})
-				require.NoErrorf(t, err, "Failed setting DNS server IPv4 addrs for: %v", addr.FriendlyName())
-				err = addr.LUID.SetDNS(windows.AF_INET6, dnsAddr, []string{})
-				require.NoErrorf(t, err, "Failed setting DNS server IPv6 addrs for: %v", addr.FriendlyName())
-			}
-		}
-	}()
+	updateSystemDNS(t, dnsInfs)
 
-	t.Log("building host-resolver host binary")
-	//TODO: make paths better
+	t.Log("Building host-resolver host binary")
 	err = buildBinaries("../../...", "windows", tmpDir)
 	require.NoError(t, err, "Failed building host-resolver.exe")
 
-	t.Log("building host-resolver peer binary")
-	//TODO: make paths better
+	t.Log("Building host-resolver peer binary")
 	err = buildBinaries("../../...", "linux", tmpDir)
 	require.NoError(t, err, "Failed building host-resolver")
 
-	//TODO: make paths better
 	aRecords := testdns.LoadRecords("../testdata/test-300.csv")
 
 	tcpHandler := testdns.NewHandler(false)
@@ -104,66 +117,93 @@ func TestLookupARecords(t *testing.T) { //nolint // TODO: break down the func
 		TCPHandler: tcpHandler,
 		UDPHandler: udpHandler,
 	}
-	t.Log("starting test upstream DNS server")
-	// TODO: this needs a shutdown
+	t.Log("Starting test upstream DNS server")
 	go testServer.Run()
 
-	t.Logf("starting host-resolver peer process in wsl [%v]", wslDistroName)
-	peerCmd := exec.Command("wsl", "--user", "root",
+	t.Logf("Starting host-resolver peer process in wsl [%v]", wslDistroName)
+	peerCmd := cmdExec(
+		tmpDir,
+		"wsl", "--user", "root",
 		"--distribution", wslDistroName,
 		"--exec", "./rancher-desktop-host-resolver", "vsock-peer")
-	peerCmd.Dir = tmpDir
-	peerCmd.Stdout = os.Stdout
-	peerCmd.Stderr = os.Stderr
 	err = peerCmd.Start()
 	require.NoError(t, err, "Starting host-resolver peer process faild")
+	defer func() {
+		_ = peerCmd.Process.Kill()
+	}()
 
-	t.Log("starting host-resolver host process")
-	hostCmd := exec.Command( //nolint:gosec // no security implications here
-		fmt.Sprintf("%v/rancher-desktop-host-resolver.exe", tmpDir), "vsock-host",
+	t.Log("Starting host-resolver host process")
+	resolverExecPath := fmt.Sprintf("%v/rancher-desktop-host-resolver.exe", tmpDir)
+	hostCmd := cmdExec(
+		tmpDir,
+		resolverExecPath, "vsock-host",
 		"--upstream-servers", fmt.Sprintf("[%v]", testSrvAddr))
-	hostCmd.Stdout = os.Stdout
-	hostCmd.Stderr = os.Stderr
 	err = hostCmd.Start()
 	require.NoError(t, err, "Starting host-resolver host process faild")
+	defer func() {
+		_ = hostCmd.Process.Kill()
+	}()
 
-	t.Log("building dns hammer binary")
+	t.Log("Building DNS hammer binary")
 	err = buildBinaries("../...", "linux", tmpDir)
 	require.NoError(t, err, "Failed building dnsHammer")
 
 	err = copyTestData("../testdata/test-300.csv", fmt.Sprintf("%s/test-300.csv", tmpDir))
-	require.NoError(t, err, "copying test data file")
-	// we need something smarter to determine if the processes are running
-	// maybe health check endpoint?
-	time.Sleep(time.Second * 5)
-	t.Logf("running dns hammer test process in wsl [%v]", wslDistroName)
+	require.NoError(t, err, "Failed copying test data file")
+
+	t.Log("Confirming host-resolver peer process is up")
+	peerCmdTimeout := time.Second * 10
+	confirm(func() bool { //nolint:errcheck // we don't care about the error
+		p, _ := os.FindProcess(peerCmd.Process.Pid)
+		return p.Pid == peerCmd.Process.Pid
+	}, tryInterval, peerCmdTimeout)
+
+	t.Logf("Running dns hammer test process in wsl [%v]", wslDistroName)
 	dnsSrvAddr := net.JoinHostPort(testSrvAddr, dnsPort)
-	runTestCmd := exec.Command(
+	runTestCmd := cmdExec(
+		tmpDir,
 		"wsl",
 		"--user", "root",
 		"--distribution", wslDistroName,
 		"--exec", "./test", "dnshammer",
 		"--server-address", dnsSrvAddr,
 		"--rr-type", "A=test-300.csv")
-	runTestCmd.Dir = tmpDir
-	runTestCmd.Stdout = os.Stdout
-	runTestCmd.Stderr = os.Stderr
 	err = runTestCmd.Run()
 	require.NoError(t, err, "Running dns hammer against the peer process faild")
-	_ = hostCmd.Process.Kill()
-	_ = peerCmd.Process.Kill()
 	_ = runTestCmd.Process.Kill()
 }
 
-// TODO (Nino-K): this should be replaced by CI
+// TODO (Nino-K): maybe this can be replaced by CI
 func buildBinaries(path, goos, tmpDir string) error {
 	buildCmd := exec.Command("go", "build", "-o", tmpDir, path)
 	buildCmd.Env = os.Environ()
-	buildCmd.Env = append(buildCmd.Env, fmt.Sprintf("GOOS=%s", goos), "GOARCH=amd64")
+	buildCmd.Env = append(buildCmd.Env, fmt.Sprintf("GOOS=%s", goos))
 	buildCmd.Stdout = os.Stdout
 	buildCmd.Stderr = os.Stderr
 
 	return buildCmd.Run()
+}
+
+func cmdRunWithOutput(command string, args ...string) (string, error) {
+	var outBuf, errBuf strings.Builder
+	cmd := exec.Command(command, args...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err != nil {
+		return errBuf.String(), err
+	}
+	return outBuf.String(), nil
+}
+
+func cmdExec(execDir, command string, args ...string) *exec.Cmd {
+	cmd := exec.Command(command, args...)
+	if execDir != "" {
+		cmd.Dir = execDir
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
 }
 
 func copyTestData(src, dst string) error {
@@ -175,10 +215,8 @@ func copyTestData(src, dst string) error {
 }
 
 func cacheExsitingDNSAddrs(adapterAddrs []*winipcfg.IPAdapterAddresses) (map[string][]netip.Addr, error) {
-	var adapterAddrsCopy = make([]*winipcfg.IPAdapterAddresses, len(adapterAddrs))
-	copy(adapterAddrsCopy, adapterAddrs)
 	guidToDNSAddrs := make(map[string][]netip.Addr)
-	for _, a := range adapterAddrsCopy {
+	for _, a := range adapterAddrs {
 		guid, err := a.LUID.GUID()
 		if err != nil {
 			return nil, err
@@ -190,4 +228,43 @@ func cacheExsitingDNSAddrs(adapterAddrs []*winipcfg.IPAdapterAddresses) (map[str
 		guidToDNSAddrs[guid.String()] = dnsAddrs
 	}
 	return guidToDNSAddrs, nil
+}
+
+func confirm(command func() bool, interval, timeout time.Duration) error {
+	tick := time.NewTicker(interval)
+	terminate := time.After(timeout)
+
+	for {
+		select {
+		case <-tick.C:
+			if command() {
+				return nil
+			}
+		case <-terminate:
+			return fmt.Errorf("Failed to run within %v", timeout)
+		}
+	}
+}
+
+func updateSystemDNS(t *testing.T, dnsInfs []*winipcfg.IPAdapterAddresses) {
+	testDNSAddr := netip.MustParseAddr(testSrvAddr)
+	testDNSAddrIPv6 := netip.IPv6Unspecified()
+	for _, addr := range dnsInfs {
+		// Set IPv4 DNS
+		err := addr.LUID.SetDNS(windows.AF_INET, []netip.Addr{testDNSAddr}, []string{})
+		require.NoErrorf(t, err, "Failed setting IPv4 DNS server for: %v", addr.FriendlyName())
+		// Set IPv6 DNS to unspecified so DNS lookup will not be bypassed
+		err = addr.LUID.SetDNS(windows.AF_INET6, []netip.Addr{testDNSAddrIPv6}, []string{})
+		require.NoErrorf(t, err, "Failed setting IPv6 DNS server for: %v", addr.FriendlyName())
+	}
+}
+
+func restoreSystemDNS(t *testing.T, addrs []*winipcfg.IPAdapterAddresses, cachedAddrs map[string][]netip.Addr) {
+	t.Log("Restoring DNS servers back to the original state")
+	for _, addr := range addrs {
+		err := addr.LUID.FlushDNS(windows.AF_INET)
+		require.NoErrorf(t, err, "Failed to flush DNS for IPv4 addrs for: %v", addr.FriendlyName())
+		err = addr.LUID.FlushDNS(windows.AF_INET6)
+		require.NoErrorf(t, err, "Failed to flush DNS for IPv6 addrs for: %v", addr.FriendlyName())
+	}
 }

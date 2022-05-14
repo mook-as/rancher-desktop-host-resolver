@@ -18,9 +18,9 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-// GetDnsInterfaces returns network interfaces that have active DNS servers associtatd to them.
+// GetDnsInterfaces returns network interfaces that have active DNS servers associated to them.
 // The filtering criteria requests all address families using AF_UNSPEC since interfaces can have
-// DNS server addrs for IPv6 and not IPv4 vice a versa. It further checks the operation status of the
+// DNS server addrs for IPv6 and not IPv4, or vice versa. It further checks the operation status of the
 // adapter's address to make sure it is up. The final filter is to remove all the addresses without a
 // DCHP server, this filter eliminates interfaces that are not dynamically configured
 // e.g. VirtualBox Host-Only Network, vEthernet (WSL)
